@@ -1,108 +1,87 @@
 import { NextRequest, NextResponse } from "next/server";
-import { exec } from "child_process";
-import { writeFile, unlink, mkdir } from "fs/promises";
-import { existsSync } from "fs";
-import path from "path";
-import { promisify } from "util";
-
-const execAsync = promisify(exec);
-const TMP_DIR = "/tmp/codehub";
-
-async function ensureTmpDir() {
-  if (!existsSync(TMP_DIR)) await mkdir(TMP_DIR, { recursive: true });
-}
 
 type Lang = "python" | "c";
 type Problem = { id: number; title: string; description: string; hint: string };
 
-// Normalize stdin: "3 5" → "3\n5\n"
+const LANG_ID: Record<string, number> = {
+  c:      50,
+  python: 71,
+};
+
 function normalizeStdin(stdin: string): string {
   if (!stdin || !stdin.trim()) return "";
   return stdin.trim().split(/\s+/).join("\n") + "\n";
 }
 
-// Run code and get output
-async function runCode(code: string, lang: Lang, stdin: string): Promise<string> {
-  const id = Date.now() + Math.random().toString(36).slice(2);
-  await ensureTmpDir();
-
-  const stdinFile = path.join(TMP_DIR, id + ".stdin");
-  await writeFile(stdinFile, normalizeStdin(stdin));
-
-  try {
-    if (lang === "c") {
-      const srcFile = path.join(TMP_DIR, id + ".c");
-      const exeFile = path.join(TMP_DIR, id);
-      await writeFile(srcFile, code);
-
-      try {
-        await execAsync(`gcc "${srcFile}" -o "${exeFile}" -lm -std=c11 -w`, { timeout: 10000 });
-      } catch (e: any) {
-        return "COMPILE_ERROR:" + (e.stderr || "");
-      } finally {
-        try { await unlink(srcFile); } catch {}
-      }
-
-      try {
-        const { stdout, stderr } = await execAsync(`"${exeFile}" < "${stdinFile}"`, { timeout: 5000 });
-        if (!stdout.trim() && stderr) return "RUNTIME_ERROR:" + stderr;
-        return stdout.trim();
-      } catch (e: any) {
-        if (e.killed) return "TIMEOUT";
-        return (e.stdout || "").trim() || "RUNTIME_ERROR:" + (e.stderr || "");
-      } finally {
-        try { await unlink(exeFile); } catch {}
-      }
-    }
-
-    if (lang === "python") {
-      const srcFile = path.join(TMP_DIR, id + ".py");
-      await writeFile(srcFile, code);
-
-      try {
-        const pyCmd = process.platform === "win32" ? "python" : "python3";
-        const { stdout, stderr } = await execAsync(`${pyCmd} "${srcFile}" < "${stdinFile}"`, { timeout: 5000 });
-        if (!stdout.trim() && stderr) return "RUNTIME_ERROR:" + stderr;
-        return stdout.trim();
-      } catch (e: any) {
-        if (e.killed) return "TIMEOUT";
-        const out = (e.stdout || "").trim();
-        return out || "RUNTIME_ERROR:" + (e.stderr || "");
-      } finally {
-        try { await unlink(srcFile); } catch {}
-      }
-    }
-
-    return "UNSUPPORTED";
-  } finally {
-    try { await unlink(stdinFile); } catch {}
-  }
+async function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Extract actual answer - remove prompt lines like "enter no:", "sum is:"
+async function runWithJudge0(code: string, lang: Lang, stdin: string): Promise<{ output: string; error: boolean }> {
+  const JUDGE0_URL = process.env.JUDGE0_URL || "https://judge0-ce.p.rapidapi.com";
+  const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY || "";
+
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (RAPIDAPI_KEY) {
+    headers["X-RapidAPI-Key"] = RAPIDAPI_KEY;
+    headers["X-RapidAPI-Host"] = "judge0-ce.p.rapidapi.com";
+  }
+
+  const submitRes = await fetch(`${JUDGE0_URL}/submissions?base64_encoded=false&wait=false`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      language_id: LANG_ID[lang],
+      source_code: code,
+      stdin: normalizeStdin(stdin),
+    }),
+  });
+
+  if (!submitRes.ok) return { output: "SERVICE_UNAVAILABLE", error: true };
+
+  const { token } = await submitRes.json();
+
+  for (let i = 0; i < 10; i++) {
+    await sleep(1000);
+    const res = await fetch(`${JUDGE0_URL}/submissions/${token}?base64_encoded=false`, { headers });
+    const result = await res.json();
+
+    if (result.status?.id <= 2) continue;
+
+    if (result.status?.id === 3 || result.status?.id === 4) {
+      return { output: (result.stdout || "").trim(), error: false };
+    }
+    if (result.status?.id === 5) {
+      return { output: "TIMEOUT", error: true };
+    }
+    if (result.status?.id === 6) {
+      return { output: "COMPILE_ERROR:" + (result.compile_output || ""), error: true };
+    }
+    const err = result.stderr || result.compile_output || result.message || "Runtime error";
+    return { output: "RUNTIME_ERROR:" + err, error: true };
+  }
+
+  return { output: "TIMEOUT", error: true };
+}
+
 function extractAnswer(output: string): string {
   if (!output) return "";
   const lines = output.split("\n").map(l => l.trim()).filter(Boolean);
   if (lines.length === 0) return "";
   if (lines.length === 1) return lines[0];
-
   const promptKeywords = ["enter", "input", "type", "give", "provide", "please"];
   const ansLines = lines.filter(line => {
     const lower = line.toLowerCase();
     return !promptKeywords.some(k => lower.startsWith(k));
   });
-
   return ansLines.length > 0 ? ansLines.join("\n") : lines[lines.length - 1];
 }
 
-// Match output vs expected
 function matches(rawOutput: string, expected: string): boolean {
   const answer = extractAnswer(rawOutput);
   const a = answer.toLowerCase().trim();
   const e = expected.toLowerCase().trim();
   if (a === e) return true;
-
-  // Check each line
   for (const line of a.split("\n")) {
     const l = line.trim();
     if (l === e) return true;
@@ -114,11 +93,9 @@ function matches(rawOutput: string, expected: string): boolean {
   return false;
 }
 
-// Format error with hint
 function fmtError(raw: string, lang: Lang): string {
   const isCompile = raw.startsWith("COMPILE_ERROR:");
   const err = raw.replace(/^(COMPILE_ERROR|RUNTIME_ERROR):/, "");
-
   const lines = err.split("\n");
   const result: string[] = [];
   for (const line of lines) {
@@ -130,28 +107,23 @@ function fmtError(raw: string, lang: Lang): string {
       result.push(line.trim()); continue;
     }
   }
-
   let out = result.join("\n").trim() || err.split("\n").slice(0,4).join("\n").trim();
-
   if (lang === "c") {
-    if (err.includes("expected ';'")) out += "\n💡 Every statement needs ;";
+    if (err.includes("expected ';'"))    out += "\n💡 Every statement needs ;";
     else if (err.includes("undeclared")) out += "\n💡 Declare variable: int x;";
-    else if (err.includes("implicit decl")) out += "\n💡 Add: #include <stdio.h>";
-    else if (err.includes("too few arg")) out += "\n💡 scanf needs &: scanf(\"%d\", &n)";
-    else if (err.includes("format")) out += "\n💡 Use %d=int %f=float %s=string";
+    else if (err.includes("implicit"))   out += "\n💡 Add: #include <stdio.h>";
+    else if (err.includes("too few"))    out += "\n💡 scanf needs &: scanf(\"%d\", &n)";
   } else {
-    if (err.includes("SyntaxError")) out += "\n💡 Missing colon (:) after if/for/while/def?";
+    if (err.includes("SyntaxError"))          out += "\n💡 Missing colon (:) after if/for/while/def?";
     else if (err.includes("IndentationError")) out += "\n💡 Use 4 spaces consistently.";
-    else if (err.includes("NameError")) out += "\n💡 Variable not defined. Check spelling.";
-    else if (err.includes("TypeError")) out += "\n💡 Use int() str() float() for conversion.";
-    else if (err.includes("ValueError")) out += "\n💡 Check your int(input()) usage.";
+    else if (err.includes("NameError"))        out += "\n💡 Variable not defined. Check spelling.";
+    else if (err.includes("TypeError"))        out += "\n💡 Use int() str() float() for conversion.";
+    else if (err.includes("ValueError"))       out += "\n💡 Check your int(input()) usage.";
     else if (err.includes("ZeroDivisionError")) out += "\n💡 Cannot divide by zero!";
   }
-
   return `❌ ${isCompile ? "Compile" : "Runtime"} Error:\n${out}`;
 }
 
-// Test cases
 const TESTS: Record<string, { stdin: string; expected: string }[]> = {
   "Print Hello World":                   [{ stdin: "",         expected: "hello world" }],
   "Print a number":                      [{ stdin: "",         expected: "42"    }],
@@ -214,38 +186,36 @@ export async function POST(req: NextRequest) {
     const title = problem.title;
     const tests = TESTS[title];
 
-    // Print your name
+    // Print your name - special case
     if (title === "Print your name") {
-      const out = await runCode(code, lang, "");
-      if (out.startsWith("COMPILE_ERROR") || out.startsWith("RUNTIME_ERROR"))
-        return NextResponse.json({ correct: false, feedback: fmtError(out, lang), suggestion: "" });
-      if (/[a-zA-Z]/.test(out.trim()))
+      const { output, error } = await runWithJudge0(code, lang, "");
+      if (error) return NextResponse.json({ correct: false, feedback: fmtError(output, lang), suggestion: "" });
+      if (/[a-zA-Z]/.test(output.trim()))
         return NextResponse.json({ correct: true, feedback: "🎉 Your name printed correctly!", suggestion: "" });
       return NextResponse.json({ correct: false, feedback: "❌ Print your name as a string.", suggestion: "" });
     }
 
     if (!tests || tests.length === 0) {
-      const out = await runCode(code, lang, "");
-      if (out.startsWith("COMPILE_ERROR") || out.startsWith("RUNTIME_ERROR"))
-        return NextResponse.json({ correct: false, feedback: fmtError(out, lang), suggestion: "" });
+      const { output, error } = await runWithJudge0(code, lang, "");
+      if (error) return NextResponse.json({ correct: false, feedback: fmtError(output, lang), suggestion: "" });
       return NextResponse.json({ correct: true, feedback: "🎉 Code ran successfully!", suggestion: "" });
     }
 
     for (let i = 0; i < tests.length; i++) {
       const test = tests[i];
-      const rawOut = await runCode(code, lang, test.stdin);
+      const { output, error } = await runWithJudge0(code, lang, test.stdin);
 
-      if (rawOut === "TIMEOUT")
+      if (output === "TIMEOUT")
         return NextResponse.json({ correct: false, feedback: "⏱ Time Limit Exceeded! Check for infinite loops.", suggestion: getSolution(title, lang) });
 
-      if (rawOut.startsWith("COMPILE_ERROR") || rawOut.startsWith("RUNTIME_ERROR"))
-        return NextResponse.json({ correct: false, feedback: fmtError(rawOut, lang), suggestion: getSolution(title, lang) });
+      if (error)
+        return NextResponse.json({ correct: false, feedback: fmtError(output, lang), suggestion: getSolution(title, lang) });
 
-      if (!matches(rawOut, test.expected)) {
-        const answer = extractAnswer(rawOut);
+      if (!matches(output, test.expected)) {
+        const answer = extractAnswer(output);
         return NextResponse.json({
           correct: false,
-          feedback: `❌ Wrong Answer!\n\nTest ${i+1}:\nInput:    ${test.stdin || "(none)"}\nExpected: ${test.expected}\nGot:      ${answer}\n\n⚠️ Don't print extra text like "sum is" — just print the result directly!`,
+          feedback: `❌ Wrong Answer!\n\nTest ${i+1}:\nInput:    ${test.stdin || "(none)"}\nExpected: ${test.expected}\nGot:      ${answer}\n\n⚠️ Don't print extra text — just print the result directly!`,
           suggestion: getSolution(title, lang),
         });
       }
