@@ -1,129 +1,150 @@
 import { NextRequest, NextResponse } from "next/server";
-import { exec } from "child_process";
-import { writeFile, unlink, mkdir } from "fs/promises";
-import { existsSync } from "fs";
-import path from "path";
-import { promisify } from "util";
 
-const execAsync = promisify(exec);
-const TMP_DIR = "/tmp/codehub";
+// Judge0 language IDs
+const LANG_ID: Record<string, number> = {
+  c:      50,  // C (GCC 9.2.0)
+  python: 71,  // Python 3.8.1
+};
 
-async function ensureTmpDir() {
-  if (!existsSync(TMP_DIR)) await mkdir(TMP_DIR, { recursive: true });
-}
-
-// KEY FIX: "3 5" → "3\n5\n" so scanf("%d%d") and scanf("%d %d") both work
 function normalizeStdin(stdin: string): string {
   if (!stdin || !stdin.trim()) return "";
   return stdin.trim().split(/\s+/).join("\n") + "\n";
 }
 
-function formatCError(err: string): string {
-  const lines = err.split("\n");
-  const result: string[] = [];
-  for (const line of lines) {
-    const m = line.match(/[^:]+:(\d+):\d+:\s*(error):\s*(.+)$/);
-    if (m) result.push(`Line ${m[1]}: ${m[3].trim()}`);
+function formatError(output: string, lang: string): string {
+  if (!output) return "Runtime error.";
+  if (lang === "c") {
+    const lines = output.split("\n");
+    const result: string[] = [];
+    for (const line of lines) {
+      const m = line.match(/[^:]+:(\d+):\d+:\s*(error):\s*(.+)$/);
+      if (m) result.push(`Line ${m[1]}: ${m[3].trim()}`);
+    }
+    let out = result.length > 0 ? result.join("\n") : output.split("\n").slice(0, 5).join("\n");
+    if (output.includes("expected ';'"))    out += "\n\n💡 Every C statement needs ;";
+    else if (output.includes("undeclared")) out += "\n\n💡 Declare variable: int x;";
+    else if (output.includes("implicit"))   out += "\n\n💡 Add: #include <stdio.h>";
+    else if (output.includes("too few"))    out += "\n\n💡 scanf needs &: scanf(\"%d\", &n)";
+    return "❌ Compile Error:\n" + out;
   }
-  let out = result.length > 0 ? result.join("\n") : err.split("\n").slice(0, 5).join("\n");
-  if (err.includes("expected ';'")) out += "\n\n💡 Every C statement needs ;";
-  else if (err.includes("undeclared")) out += "\n\n💡 Declare variable: int x;";
-  else if (err.includes("implicit decl")) out += "\n\n💡 Add: #include <stdio.h>";
-  else if (err.includes("too few arg")) out += "\n\n💡 scanf needs &: scanf(\"%d\", &n)";
-  else if (err.includes("format")) out += "\n\n💡 Use %d=int, %f=float, %s=string";
-  return "❌ Compile Error:\n" + out;
+  if (lang === "python") {
+    let out = output.trim().split("\n").slice(-4).join("\n");
+    if (output.includes("SyntaxError"))       out += "\n\n💡 Missing colon (:) after if/for/while/def?";
+    else if (output.includes("IndentationError")) out += "\n\n💡 Use 4 spaces consistently.";
+    else if (output.includes("NameError"))    out += "\n\n💡 Variable not defined. Check spelling.";
+    else if (output.includes("TypeError"))    out += "\n\n💡 Use int(), str(), float() for conversion.";
+    else if (output.includes("ValueError"))   out += "\n\n💡 Check your int(input()) usage.";
+    else if (output.includes("ZeroDivisionError")) out += "\n\n💡 Cannot divide by zero!";
+    return "❌ Error:\n" + out;
+  }
+  return output;
 }
 
-function formatPyError(err: string): string {
-  const lines = err.split("\n");
-  const result: string[] = [];
-  for (const line of lines) {
-    if (/(SyntaxError|NameError|TypeError|ValueError|IndentationError|ZeroDivisionError):/.test(line))
-      result.push(line.trim());
-    else if (line.includes("line ") && line.includes("File"))
-      result.push(line.trim());
-  }
-  let out = result.length > 0 ? result.join("\n") : err.trim().split("\n").slice(-3).join("\n");
-  if (err.includes("SyntaxError")) out += "\n\n💡 Missing colon (:) after if/for/while/def?";
-  else if (err.includes("IndentationError")) out += "\n\n💡 Use 4 spaces consistently.";
-  else if (err.includes("NameError")) out += "\n\n💡 Variable not defined. Check spelling.";
-  else if (err.includes("TypeError")) out += "\n\n💡 Use int(), str(), float() for conversion.";
-  else if (err.includes("ValueError")) out += "\n\n💡 Check your int(input()) usage.";
-  else if (err.includes("ZeroDivisionError")) out += "\n\n💡 Cannot divide by zero!";
-  return "❌ Error:\n" + out;
+async function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 export async function POST(req: NextRequest) {
-  const id = Date.now() + Math.random().toString(36).slice(2);
-  await ensureTmpDir();
-
-  let stdinFile = path.join(TMP_DIR, id + ".stdin");
-  let srcFile = "";
-  let exeFile = "";
-
   try {
     const { code, lang, stdin } = await req.json();
-    if (!code?.trim()) return NextResponse.json({ output: "Please write some code first!", error: true });
 
-    // Normalize stdin: "3 5" becomes "3\n5\n"
-    await writeFile(stdinFile, normalizeStdin(stdin || ""));
-
-    if (lang === "c") {
-      srcFile = path.join(TMP_DIR, id + ".c");
-      exeFile = path.join(TMP_DIR, id);
-      await writeFile(srcFile, code);
-
-      // Compile
-      try {
-        await execAsync(`gcc "${srcFile}" -o "${exeFile}" -lm -std=c11 -w`, { timeout: 10000 });
-      } catch (e: any) {
-        return NextResponse.json({ output: formatCError(e.stderr || ""), error: true });
-      }
-
-      // Run with redirected stdin
-      try {
-        const { stdout, stderr } = await execAsync(
-          `"${exeFile}" < "${stdinFile}"`,
-          { timeout: 5000 }
-        );
-        const out = stdout.trim();
-        if (!out && stderr) return NextResponse.json({ output: formatCError(stderr), error: true });
-        return NextResponse.json({ output: out || "Program ran with no output.", error: false });
-      } catch (e: any) {
-        if (e.killed) return NextResponse.json({ output: "⏱ Time Limit Exceeded! Check for infinite loops.", error: true });
-        const out = (e.stdout || "").trim();
-        return NextResponse.json({ output: out || "Runtime error.", error: true });
-      }
+    if (!code?.trim()) {
+      return NextResponse.json({ output: "Please write some code first!", error: true });
     }
 
-    if (lang === "python") {
-      srcFile = path.join(TMP_DIR, id + ".py");
-      await writeFile(srcFile, code);
-
-      try {
-        const { stdout, stderr } = await execAsync(
-          `${process.platform === "win32" ? "python" : "python3"} "${srcFile}" < "${stdinFile}"`,
-          { timeout: 5000 }
-        );
-        const out = stdout.trim();
-        if (!out && stderr) return NextResponse.json({ output: formatPyError(stderr), error: true });
-        return NextResponse.json({ output: out || "Program ran with no output.", error: false });
-      } catch (e: any) {
-        if (e.killed) return NextResponse.json({ output: "⏱ Time Limit Exceeded! Check for infinite loops.", error: true });
-        const out = (e.stdout || "").trim();
-        const err = e.stderr || "";
-        if (!out && err) return NextResponse.json({ output: formatPyError(err), error: true });
-        return NextResponse.json({ output: out || "Runtime error.", error: true });
-      }
+    const languageId = LANG_ID[lang];
+    if (!languageId) {
+      return NextResponse.json({ output: "Unsupported language.", error: true });
     }
 
-    return NextResponse.json({ output: "Unsupported language.", error: true });
+    const JUDGE0_URL = process.env.JUDGE0_URL || "https://judge0-ce.p.rapidapi.com";
+    const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY || "";
+
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+
+    // RapidAPI key use karo agar available ho
+    if (RAPIDAPI_KEY) {
+      headers["X-RapidAPI-Key"] = RAPIDAPI_KEY;
+      headers["X-RapidAPI-Host"] = "judge0-ce.p.rapidapi.com";
+    }
+
+    // Submit code
+    const submitRes = await fetch(`${JUDGE0_URL}/submissions?base64_encoded=false&wait=false`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        language_id: languageId,
+        source_code: code,
+        stdin: normalizeStdin(stdin || ""),
+      }),
+    });
+
+    if (!submitRes.ok) {
+      return NextResponse.json({ output: "Code execution service unavailable. Try again!", error: true });
+    }
+
+    const { token } = await submitRes.json();
+
+    // Poll for result (max 10 seconds)
+    for (let i = 0; i < 10; i++) {
+      await sleep(1000);
+
+      const resultRes = await fetch(`${JUDGE0_URL}/submissions/${token}?base64_encoded=false`, {
+        headers,
+      });
+
+      const result = await resultRes.json();
+
+      // status 1 = In Queue, 2 = Processing
+      if (result.status?.id <= 2) continue;
+
+      // status 3 = Accepted
+      if (result.status?.id === 3) {
+        const out = (result.stdout || "").trim();
+        return NextResponse.json({
+          output: out || "Program ran with no output.",
+          error: false,
+        });
+      }
+
+      // status 4 = Wrong Answer (still show output)
+      if (result.status?.id === 4) {
+        return NextResponse.json({
+          output: (result.stdout || "").trim() || "No output.",
+          error: false,
+        });
+      }
+
+      // status 5 = Time Limit Exceeded
+      if (result.status?.id === 5) {
+        return NextResponse.json({
+          output: "⏱ Time Limit Exceeded! Check for infinite loops.",
+          error: true,
+        });
+      }
+
+      // Compile error (status 6)
+      if (result.status?.id === 6) {
+        return NextResponse.json({
+          output: formatError(result.compile_output || "Compile error.", lang),
+          error: true,
+        });
+      }
+
+      // Runtime error (status 7-12)
+      const errOutput = result.stderr || result.compile_output || result.message || "Runtime error.";
+      return NextResponse.json({
+        output: formatError(errOutput, lang),
+        error: true,
+      });
+    }
+
+    return NextResponse.json({ output: "Execution timed out. Try again!", error: true });
 
   } catch (e) {
+    console.error("Execute error:", e);
     return NextResponse.json({ output: "Server error. Please try again.", error: true });
-  } finally {
-    try { if (stdinFile) await unlink(stdinFile); } catch {}
-    try { if (srcFile)   await unlink(srcFile); } catch {}
-    try { if (exeFile)   await unlink(exeFile); } catch {}
   }
 }
