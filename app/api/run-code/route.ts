@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 
-// Judge0 language IDs
-const LANG_ID: Record<string, number> = {
-  c:      50,  // C (GCC 9.2.0)
-  python: 71,  // Python 3.8.1
+// JDoodle Language Mapping
+const JDOODLE_LANG: Record<string, { lang: string; version: string }> = {
+  c:      { lang: "c",       version: "5" }, // GCC 11.1.0
+  python: { lang: "python3", version: "4" }, // Python 3.10.0
 };
 
 function normalizeStdin(stdin: string): string {
@@ -40,10 +40,6 @@ function formatError(output: string, lang: string): string {
   return output;
 }
 
-async function sleep(ms: number) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
 export async function POST(req: NextRequest) {
   try {
     const { code, lang, stdin } = await req.json();
@@ -52,96 +48,48 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ output: "Please write some code first!", error: true });
     }
 
-    const languageId = LANG_ID[lang];
-    if (!languageId) {
+    const config = JDOODLE_LANG[lang];
+    if (!config) {
       return NextResponse.json({ output: "Unsupported language.", error: true });
     }
 
-    const JUDGE0_URL = process.env.JUDGE0_URL || "https://judge0-ce.p.rapidapi.com";
-    const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY || "";
-
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-    };
-
-    // RapidAPI key use karo agar available ho
-    if (RAPIDAPI_KEY) {
-      headers["X-RapidAPI-Key"] = RAPIDAPI_KEY;
-      headers["X-RapidAPI-Host"] = "judge0-ce.p.rapidapi.com";
-    }
-
-    // Submit code
-    const submitRes = await fetch(`${JUDGE0_URL}/submissions?base64_encoded=false&wait=false`, {
+    // JDoodle API Call (No Polling Loop Needed)
+    const response = await fetch("https://api.jdoodle.com/v1/execute", {
       method: "POST",
-      headers,
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        language_id: languageId,
-        source_code: code,
+        clientId: process.env.JDOODLE_CLIENT_ID,
+        clientSecret: process.env.JDOODLE_CLIENT_SECRET,
+        script: code,
         stdin: normalizeStdin(stdin || ""),
+        language: config.lang,
+        versionIndex: config.version,
       }),
     });
 
-    if (!submitRes.ok) {
-      return NextResponse.json({ output: "Code execution service unavailable. Try again!", error: true });
+    if (!response.ok) {
+      return NextResponse.json({ output: "JDoodle service unavailable. Try again!", error: true });
     }
 
-    const { token } = await submitRes.json();
+    const result = await response.json();
 
-    // Poll for result (max 10 seconds)
-    for (let i = 0; i < 10; i++) {
-      await sleep(1000);
-
-      const resultRes = await fetch(`${JUDGE0_URL}/submissions/${token}?base64_encoded=false`, {
-        headers,
-      });
-
-      const result = await resultRes.json();
-
-      // status 1 = In Queue, 2 = Processing
-      if (result.status?.id <= 2) continue;
-
-      // status 3 = Accepted
-      if (result.status?.id === 3) {
-        const out = (result.stdout || "").trim();
-        return NextResponse.json({
-          output: out || "Program ran with no output.",
-          error: false,
+    // JDoodle returns 200 even for compile errors, but output contains the error
+    // Check if memory or cpuTime is null (often indicates crash or error)
+    if (result.statusCode !== 200) {
+        return NextResponse.json({ 
+            output: formatError(result.output || "Execution failed", lang), 
+            error: true 
         });
-      }
-
-      // status 4 = Wrong Answer (still show output)
-      if (result.status?.id === 4) {
-        return NextResponse.json({
-          output: (result.stdout || "").trim() || "No output.",
-          error: false,
-        });
-      }
-
-      // status 5 = Time Limit Exceeded
-      if (result.status?.id === 5) {
-        return NextResponse.json({
-          output: "⏱ Time Limit Exceeded! Check for infinite loops.",
-          error: true,
-        });
-      }
-
-      // Compile error (status 6)
-      if (result.status?.id === 6) {
-        return NextResponse.json({
-          output: formatError(result.compile_output || "Compile error.", lang),
-          error: true,
-        });
-      }
-
-      // Runtime error (status 7-12)
-      const errOutput = result.stderr || result.compile_output || result.message || "Runtime error.";
-      return NextResponse.json({
-        output: formatError(errOutput, lang),
-        error: true,
-      });
     }
 
-    return NextResponse.json({ output: "Execution timed out. Try again!", error: true });
+    // JDoodle combines stdout and stderr in 'output'
+    // Usually, if there's an error, it's in the output.
+    const isError = result.output.toLowerCase().includes("error") || result.output.toLowerCase().includes("exception");
+
+    return NextResponse.json({
+      output: isError ? formatError(result.output, lang) : result.output.trim(),
+      error: isError,
+    });
 
   } catch (e) {
     console.error("Execute error:", e);
